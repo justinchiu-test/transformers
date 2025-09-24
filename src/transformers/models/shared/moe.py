@@ -6,204 +6,298 @@ from typing import Optional, Tuple
 
 
 class SharedRouter(nn.Module):
-    """Shared router for MoE models supporting both softmax and sigmoid routing."""
+    """Shared router for MoE models based on GPT-OSS's clean implementation."""
 
     def __init__(self, config):
         super().__init__()
-        self.num_experts = getattr(config, 'num_local_experts', config.num_experts)
-        self.num_experts_per_tok = getattr(config, 'num_experts_per_tok', config.top_k)
+        self.top_k = getattr(config, 'num_experts_per_tok', getattr(config, 'top_k', 2))
+        self.num_experts = getattr(config, 'num_local_experts', getattr(config, 'num_experts', 8))
         self.hidden_dim = config.hidden_size
 
-        # Router weights
+        # Router weights (all models have this)
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
 
-        # Some models have router bias, others don't
-        if getattr(config, 'router_bias', False):
+        # Router bias (GPT-OSS has it, others can configure)
+        if getattr(config, 'router_bias', True) if hasattr(config, 'model_type') and config.model_type == 'gpt_oss' else False:
             self.bias = nn.Parameter(torch.empty(self.num_experts))
         else:
             self.register_parameter('bias', None)
 
-        # Routing style: 'softmax' (Mixtral/DeepSeek) or 'sigmoid' (GPT-OSS)
-        self.routing_style = getattr(config, 'routing_style', 'softmax')
-
-        # Handle GPT-OSS style detection
-        if hasattr(config, 'model_type') and config.model_type == 'gpt_oss':
-            self.routing_style = 'sigmoid'
-            self.bias = nn.Parameter(torch.empty(self.num_experts))  # GPT-OSS always has bias
+        # Mixtral-specific: jitter noise
+        self.jitter_noise = getattr(config, 'router_jitter_noise', 0.0)
 
         # DeepSeek V3 specific configurations
+        self.use_sigmoid = getattr(config, 'use_sigmoid_routing', False)
+        if hasattr(config, 'model_type') and config.model_type == 'deepseek_v3':
+            self.use_sigmoid = True
         self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
-        self.topk_method = getattr(config, 'topk_method', 'greedy')
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
+
+        # DeepSeek V3 group selection (advanced feature)
         self.n_group = getattr(config, 'n_group', None)
         self.topk_group = getattr(config, 'topk_group', None)
-        self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
-        self.scoring_func = getattr(config, 'scoring_func', None)
+        if self.n_group:
+            self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts))
 
-        # Jitter noise for load balancing during training
-        self.jitter_noise = getattr(config, 'jitter_noise', 0.0)
-
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        GPT-OSS style forward pass - clean and efficient.
+
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim)
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim) or (seq_len, hidden_dim)
 
         Returns:
-            routing_weights: Tensor of shape (batch*seq_len, num_experts_per_tok)
-            selected_experts: Tensor of shape (batch*seq_len, num_experts_per_tok)
-            router_logits: Raw router outputs for auxiliary loss
+            router_scores: Tensor of shape (seq_len, num_experts) with routing weights
+            router_indices: Tensor of shape (seq_len, top_k) with selected expert indices
         """
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        # Reshape to 2D if needed
+        original_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
 
-        # Compute router logits
-        router_logits = hidden_states @ self.weight.T
-        if self.bias is not None:
-            router_logits = router_logits + self.bias
-
-        # Store raw logits for auxiliary loss computation
-        raw_router_logits = router_logits
-
-        # Apply jitter noise during training
+        # Mixtral: Apply jitter noise during training
         if self.training and self.jitter_noise > 0:
-            router_logits = router_logits + torch.randn_like(router_logits) * self.jitter_noise
+            hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
+                1.0 - self.jitter_noise, 1.0 + self.jitter_noise
+            )
 
-        if self.routing_style == 'sigmoid':
-            # GPT-OSS style: sigmoid routing
-            router_probs = torch.sigmoid(router_logits)
+        # Compute router logits (GPT-OSS style with F.linear)
+        router_logits = F.linear(hidden_states, self.weight, self.bias)
+
+        # DeepSeek V3: Group-limited selection
+        if self.n_group and self.topk_group:
+            router_indices = self._get_topk_indices_grouped(router_logits)
+            if self.use_sigmoid:
+                scores = torch.sigmoid(router_logits)
+            else:
+                scores = router_logits
+            router_top_values = scores.gather(1, router_indices)
         else:
-            # Mixtral/DeepSeek style: softmax routing
-            router_probs = F.softmax(router_logits, dim=-1)
+            # Standard top-k selection (GPT-OSS style)
+            router_top_values, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
 
-        # Select top-k experts
-        if self.topk_method == 'group_limited_greedy' and self.n_group is not None:
-            # DeepSeek V3 group-limited selection
-            routing_weights, selected_experts = self._group_limited_topk(router_probs)
+        # Apply activation and normalization
+        if self.use_sigmoid:
+            # DeepSeek V3: Use sigmoid on values
+            router_top_values = torch.sigmoid(router_top_values) if not self.n_group else router_top_values
         else:
-            # Standard top-k selection
-            routing_weights, selected_experts = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
+            # GPT-OSS/Mixtral: Softmax over selected top-k values
+            router_top_values = F.softmax(router_top_values, dim=1, dtype=router_top_values.dtype)
 
-        # Normalize routing weights if needed
-        if self.norm_topk_prob and self.routing_style == 'softmax':
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        # DeepSeek V3 & Mixtral: Optional normalization
+        if self.norm_topk_prob or (hasattr(original_shape, '__len__') and len(original_shape) == 3 and
+                                   hasattr(self, 'model_type') and self.model_type == 'mixtral'):
+            denominator = router_top_values.sum(dim=-1, keepdim=True) + 1e-20
+            router_top_values = router_top_values / denominator
 
-        # Apply routed scaling factor (DeepSeek V3)
-        routing_weights = routing_weights * self.routed_scaling_factor
+        # Apply scaling factor if configured (DeepSeek V3)
+        router_top_values = router_top_values * self.routed_scaling_factor
 
-        return routing_weights, selected_experts, raw_router_logits
+        # Create sparse routing matrix (GPT-OSS style)
+        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_values)
 
-    def _group_limited_topk(self, router_probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return router_scores, router_indices
+
+    @torch.no_grad()
+    def _get_topk_indices_grouped(self, scores: torch.Tensor) -> torch.Tensor:
         """DeepSeek V3 group-limited top-k selection."""
-        # This is a simplified version - full implementation would need more details
-        # from DeepSeek V3 config
-        group_size = self.num_experts // self.n_group
-        group_scores = router_probs.view(-1, self.n_group, group_size).max(dim=-1).values
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
 
-        # Select top groups
-        _, top_groups = torch.topk(group_scores, self.topk_group, dim=-1)
+        # Group scoring
+        group_scores = (
+            scores_for_choice.view(-1, self.n_group, self.num_experts // self.n_group)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
 
-        # Within selected groups, pick top experts
-        # This is simplified - actual implementation would be more complex
-        return torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
+        # Create group mask
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, self.n_group, self.num_experts // self.n_group)
+            .reshape(-1, self.num_experts)
+        )
+
+        # Mask and select top-k
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float('-inf'))
+        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        return topk_indices
 
 
-class SharedMoE(nn.Module):
-    """Shared MoE module combining router with expert networks."""
+class SharedExperts(nn.Module):
+    """
+    GPT-OSS style expert module - efficient and clean.
+    Can be configured for Mixtral and DeepSeek V3 compatibility.
+    """
 
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.num_experts = getattr(config, 'num_local_experts', config.num_experts)
-        self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
+        self.num_experts = getattr(config, 'num_local_experts', getattr(config, 'num_experts', 8))
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = getattr(config, 'moe_intermediate_size', config.intermediate_size)
 
-        # Router
-        self.router = SharedRouter(config)
+        # Determine expert architecture
+        self.use_fused_experts = getattr(config, 'use_fused_experts', False)
+        if hasattr(config, 'model_type') and config.model_type == 'gpt_oss':
+            self.use_fused_experts = True
 
-        # Expert networks
-        self.experts = nn.ModuleList()
+        if self.use_fused_experts:
+            # GPT-OSS style: fused gate_up projection
+            self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.intermediate_size))
+            self.gate_up_proj_bias = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_size))
+            self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_size, self.hidden_size))
+            self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
 
-        # Determine expert type based on config
-        expert_type = getattr(config, 'expert_type', 'standard')
-
-        # Handle model-specific expert types
-        if hasattr(config, 'model_type'):
-            if config.model_type == 'gpt_oss':
-                expert_type = 'gpt_oss'
-            elif config.model_type == 'mixtral':
-                expert_type = 'mixtral'
-            elif config.model_type == 'deepseek_v3':
-                expert_type = 'deepseek_v3'
-
-        # Create experts based on type
-        for _ in range(self.num_experts):
-            if expert_type == 'gpt_oss':
-                # GPT-OSS uses single fused gate_up and down projections
-                from .mlp import SharedMLP
-                self.experts.append(SharedMLP(config))
-            else:
-                # Mixtral/DeepSeek use standard MLP experts
-                from .mlp import SharedMLP
-                self.experts.append(SharedMLP(config))
-
-        # Shared expert for DeepSeek V3
-        self.has_shared_expert = getattr(config, 'use_shared_expert', False)
-        if self.has_shared_expert:
+            # GPT-OSS specific activation parameters
+            self.alpha = getattr(config, 'moe_alpha', 1.702)
+            self.limit = getattr(config, 'moe_limit', 7.0)
+        else:
+            # Mixtral/DeepSeek style: separate expert MLPs
             from .mlp import SharedMLP
-            self.shared_expert = SharedMLP(config)
+            self.experts = nn.ModuleList([
+                SharedMLP(config) for _ in range(self.num_experts)
+            ])
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor, router_indices: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
         """
+        GPT-OSS style expert processing - clean and efficient.
+
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim)
-            router_logits: Optional precomputed router logits
+            hidden_states: (batch_size, seq_len, hidden_size) or (seq_len, hidden_size)
+            router_indices: (seq_len, top_k) - which experts to use
+            routing_weights: (seq_len, num_experts) - sparse routing weights
 
         Returns:
-            output: Output tensor of shape (batch, seq_len, hidden_dim)
-            router_logits: Router logits for auxiliary loss
+            Output tensor of same shape as hidden_states
         """
-        batch_size, seq_len, hidden_dim = hidden_states.shape
+        # Handle different input shapes
+        if hidden_states.dim() == 3:
+            batch_size, seq_len, hidden_size = hidden_states.shape
+            hidden_states = hidden_states.reshape(-1, hidden_size)
+            reshape_output = True
+        else:
+            batch_size = 1
+            seq_len = hidden_states.shape[0]
+            hidden_size = hidden_states.shape[1]
+            reshape_output = False
 
-        # Get routing weights and selected experts
-        routing_weights, selected_experts, router_logits = self.router(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        num_experts = routing_weights.shape[1]
 
-        # Flatten input for expert processing
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        if self.use_fused_experts:
+            # GPT-OSS implementation
+            next_states = torch.zeros_like(hidden_states)
 
-        # Initialize output tensor
-        output = torch.zeros_like(hidden_states_flat)
+            # Create expert mask for efficient processing
+            expert_mask = F.one_hot(router_indices, num_classes=num_experts + 1)
+            expert_mask = expert_mask.permute(2, 1, 0)
 
-        # Process each expert
-        for expert_idx in range(self.num_experts):
-            # Find tokens assigned to this expert
-            expert_mask = (selected_experts == expert_idx).any(dim=-1)
+            # Find which experts are active
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-            if expert_mask.any():
+            for expert_idx in expert_hit:
+                expert_idx = expert_idx[0]
+                if expert_idx == num_experts:  # skip padding index
+                    continue
+
+                # Find tokens for this expert
+                _, token_idx = torch.where(expert_mask[expert_idx])
+                current_state = hidden_states[token_idx]
+
+                # Fused gate_up projection
+                gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
+                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+
+                # GPT-OSS activation with clamping
+                gate = gate.clamp(min=None, max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+                glu = gate * torch.sigmoid(gate * self.alpha)
+                gated_output = (up + 1) * glu
+
+                # Down projection
+                out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
+
+                # Apply routing weights and accumulate
+                weighted_output = out * routing_weights[token_idx, expert_idx, None]
+                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
+        else:
+            # Mixtral/DeepSeek style
+            next_states = torch.zeros_like(hidden_states)
+
+            # One-hot encode selected experts
+            expert_mask = F.one_hot(router_indices, num_classes=num_experts).permute(2, 1, 0)
+
+            for expert_idx in range(num_experts):
+                # Check if this expert is used
+                expert_mask_idx = expert_mask[expert_idx]
+                if not expert_mask_idx.any():
+                    continue
+
+                idx, top_x = torch.where(expert_mask_idx)
+
                 # Get tokens for this expert
-                expert_input = hidden_states_flat[expert_mask]
+                current_state = hidden_states[top_x]
 
-                # Apply expert
-                expert_output = self.experts[expert_idx](expert_input)
+                # Apply expert MLP
+                expert_output = self.experts[expert_idx](current_state)
 
-                # Get routing weights for this expert
-                expert_weights = routing_weights[expert_mask]
-                expert_weights = expert_weights[selected_experts[expert_mask] == expert_idx]
+                # Apply routing weights
+                weighted_output = expert_output * routing_weights[top_x, expert_idx, None]
 
-                # Weighted sum
-                weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                # Accumulate output
+                next_states.index_add_(0, top_x, weighted_output.to(hidden_states.dtype))
 
-                # Add to output
-                output[expert_mask] += weighted_output
+        # Reshape if needed
+        if reshape_output:
+            next_states = next_states.view(batch_size, seq_len, hidden_size)
 
-        # Add shared expert output if present (DeepSeek V3)
-        if self.has_shared_expert:
-            shared_output = self.shared_expert(hidden_states_flat)
-            output = output + shared_output
+        return next_states
 
-        # Reshape output
-        output = output.view(batch_size, seq_len, hidden_dim)
 
-        return output, router_logits
+class SharedMoE(nn.Module):
+    """
+    Complete MoE module based on GPT-OSS design.
+    Combines router and experts with optional shared experts (DeepSeek V3).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.router = SharedRouter(config)
+        self.experts = SharedExperts(config)
+
+        # DeepSeek V3: Optional shared experts
+        self.use_shared_experts = getattr(config, 'use_shared_experts', False)
+        if self.use_shared_experts:
+            from .mlp import SharedMLP
+            n_shared = getattr(config, 'n_shared_experts', 2)
+            shared_intermediate_size = config.intermediate_size * n_shared
+            # Create a config for shared expert with larger intermediate size
+            shared_config = type(config)(**{**config.__dict__, 'intermediate_size': shared_intermediate_size})
+            self.shared_experts = SharedMLP(shared_config)
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass following GPT-OSS's clean design.
+
+        Args:
+            hidden_states: Input tensor
+
+        Returns:
+            output: Processed tensor
+            router_scores: Router scores for auxiliary loss
+        """
+        # Route tokens to experts
+        router_scores, router_indices = self.router(hidden_states)
+
+        # Process through routed experts
+        routed_output = self.experts(hidden_states, router_indices, router_scores)
+
+        # Add shared experts if configured (DeepSeek V3)
+        if self.use_shared_experts:
+            shared_output = self.shared_experts(hidden_states)
+            output = routed_output + shared_output
+        else:
+            output = routed_output
+
+        return output, router_scores
