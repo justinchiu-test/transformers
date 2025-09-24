@@ -128,34 +128,57 @@ For each model, follow these steps:
 1. **Import shared components:**
    ```python
    from ..shared import SharedAttention, SharedMLP, SharedRMSNorm
+   from ..shared.embeddings import apply_rotary_pos_emb, rotate_half
    ```
 
-2. **Replace duplicated code with shared components:**
-   - Replace attention implementations with shared version
-   - Replace MLP implementations with shared version
-   - Replace normalization layers with shared version
+2. **COMPLETELY REMOVE and replace duplicated code:**
+   - **DELETE** the original attention class (e.g., `LlamaAttention`) and replace ALL references with `SharedAttention`
+   - **DELETE** the original MLP class (e.g., `LlamaMLP`) and replace ALL references with `SharedMLP`
+   - **DELETE** the original RMSNorm class (e.g., `LlamaRMSNorm`) and replace ALL references with `SharedRMSNorm`
+   - **DELETE** the original RoPE functions (`rotate_half`, `apply_rotary_pos_emb`) and import from shared
+   - **UPDATE** all class instantiations throughout the file (in DecoderLayer, Model classes, etc.)
+   - **ENSURE** no duplicate implementations remain in the original file
 
-3. **Maintain model-specific logic:**
-   - Keep unique features in model-specific files
-   - Use configuration parameters to customize shared components
+3. **Update all references throughout the file:**
+   ```python
+   # Before:
+   self.self_attn = LlamaAttention(config, layer_idx)
+   self.mlp = LlamaMLP(config)
+   self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-4. **Update model initialization:**
-   - Modify `__init__` methods to use shared components
-   - Ensure backward compatibility with existing checkpoints
+   # After:
+   self.self_attn = SharedAttention(config, layer_idx)
+   self.mlp = SharedMLP(config)
+   self.input_layernorm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+   ```
+
+4. **Maintain model-specific logic ONLY:**
+   - Keep ONLY unique features that are NOT in shared components
+   - Remove ALL duplicate implementations
+   - The file should be significantly shorter after refactoring
+
+5. **Verify complete refactoring:**
+   - Search for old class names - they should NOT exist
+   - Ensure ALL instances use shared components
+   - Original model file should have ~200-300 fewer lines
 
 ### Phase 4: Testing
-1. **Run existing tests (modeling files only, not tokenization):**
+1. **Run existing tests (modeling files only, not tokenization) using uv:**
    ```bash
-   pytest tests/models/qwen2/test_modeling_qwen2.py
-   pytest tests/models/llama/test_modeling_llama.py
-   pytest tests/models/gemma/test_modeling_gemma.py
-   pytest tests/models/mistral/test_modeling_mistral.py
-   pytest tests/models/qwen2_vl/test_modeling_qwen2_vl.py
-   pytest tests/models/gpt_oss/test_modeling_gpt_oss.py
-   pytest tests/models/deepseek_v3/test_modeling_deepseek_v3.py
-   pytest tests/models/mixtral/test_modeling_mixtral.py
-   pytest tests/models/olmo2/test_modeling_olmo2.py
-   pytest tests/models/qwen3/test_modeling_qwen3.py
+   # Using uv to run pytest
+   uv run pytest tests/models/qwen2/test_modeling_qwen2.py
+   uv run pytest tests/models/llama/test_modeling_llama.py
+   uv run pytest tests/models/gemma/test_modeling_gemma.py
+   uv run pytest tests/models/mistral/test_modeling_mistral.py
+   uv run pytest tests/models/qwen2_vl/test_modeling_qwen2_vl.py
+   uv run pytest tests/models/gpt_oss/test_modeling_gpt_oss.py
+   uv run pytest tests/models/deepseek_v3/test_modeling_deepseek_v3.py
+   uv run pytest tests/models/mixtral/test_modeling_mixtral.py
+   uv run pytest tests/models/olmo2/test_modeling_olmo2.py
+   uv run pytest tests/models/qwen3/test_modeling_qwen3.py
+
+   # Or run all tests for a model at once:
+   uv run python -m pytest -n auto --dist=loadfile -s -v ./tests/models/qwen2/test_modeling_qwen2.py
    ```
 
    **Note:** Tokenization tests are excluded from the testing scope.
@@ -228,6 +251,11 @@ tests/models/shared/
 └── test_cache.py
 ```
 
+Run shared component tests using uv:
+```bash
+uv run pytest tests/models/shared/
+```
+
 ### Integration Tests
 - Ensure each refactored model passes its existing test suite
 - Add regression tests comparing outputs before and after refactoring
@@ -250,9 +278,27 @@ The timeline will depend on the pace and scope you set for each refactoring sess
 ## Success Criteria
 
 - [ ] All 10 models refactored to use shared library
+- [ ] **Original duplicate classes COMPLETELY REMOVED from model files**
+- [ ] **Each model file reduced by ~200-300 lines**
 - [ ] All existing tests pass
 - [ ] No performance regression (< 5% tolerance)
 - [ ] Backward compatibility maintained
-- [ ] Code duplication reduced by at least 50%
+- [ ] Code duplication reduced by at least 50% (~1400+ lines eliminated)
+- [ ] **No duplicate implementations remain (verified by grep)**
 - [ ] Documentation updated
 - [ ] Peer review completed
+
+## Verification Checklist
+
+After refactoring each model, verify:
+```bash
+# These commands should return NO results after refactoring:
+grep "class.*RMSNorm" src/transformers/models/{model_name}/modeling_{model_name}.py
+grep "class.*MLP" src/transformers/models/{model_name}/modeling_{model_name}.py
+grep "class.*Attention" src/transformers/models/{model_name}/modeling_{model_name}.py  # except for special variants
+grep "def rotate_half" src/transformers/models/{model_name}/modeling_{model_name}.py
+grep "def apply_rotary_pos_emb" src/transformers/models/{model_name}/modeling_{model_name}.py
+
+# Line count should be reduced:
+wc -l src/transformers/models/{model_name}/modeling_{model_name}.py  # Should be ~200-300 lines less
+```
