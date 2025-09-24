@@ -201,6 +201,9 @@ class Qwen3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        # Add flags for SharedAttention with per-head normalization (Qwen3 style)
+        self.use_qk_norm = True  # Enable query-key normalization
+        self.qk_norm_per_head = True  # Apply normalization per head (Qwen3 style)
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
