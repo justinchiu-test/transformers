@@ -35,7 +35,7 @@ class SharedRMSNorm(nn.Module):
             return output.to(input_dtype)
         else:
             # Standard style: weight * normalized_hidden_states
-            return self.weight * hidden_states.to(input_dtype)
+            return (self.weight.float() * hidden_states).to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"

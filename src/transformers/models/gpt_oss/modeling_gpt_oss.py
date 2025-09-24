@@ -24,6 +24,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ..shared import SharedRMSNorm, repeat_kv
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...integrations.hub_kernels import use_kernel_forward_from_hub
@@ -43,25 +44,8 @@ from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
 
 
-@use_kernel_forward_from_hub("RMSNorm")
-class GptOssRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        GptOssRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)  # main diff with Llama
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+# GPT OSS uses standard RMSNorm (same as T5LayerNorm)
+GptOssRMSNorm = SharedRMSNorm
 
 
 class GptOssExperts(nn.Module):
@@ -207,18 +191,9 @@ class GptOssRotaryEmbedding(nn.Module):
         return cos.to(x.dtype), sin.to(x.dtype)
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+# GPT OSS has a special rotary embedding that doesn't concatenate freqs
 def _apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -231,6 +206,7 @@ def _apply_rotary_emb(
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """GPT OSS specific rotary position embedding that uses _apply_rotary_emb instead of rotate_half."""
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = _apply_rotary_emb(q, cos, sin)
@@ -349,8 +325,8 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = GptOssAttention(config=config, layer_idx=layer_idx)
         self.mlp = GptOssMLP(config)
-        self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -422,7 +398,7 @@ class GptOssPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, GptOssRMSNorm):
+        elif isinstance(module, SharedRMSNorm):
             module.weight.data.fill_(1.0)
         elif isinstance(module, GptOssExperts):
             module.gate_up_proj.data.normal_(mean=0.0, std=std)
@@ -449,7 +425,7 @@ class GptOssModel(GptOssPreTrainedModel):
         self.layers = nn.ModuleList(
             [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = GptOssRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
