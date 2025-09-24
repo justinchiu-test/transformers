@@ -24,7 +24,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ..shared import SharedRMSNorm, repeat_kv
+from ..shared import SharedRMSNorm, SharedAttention, SharedDecoderLayer, repeat_kv
+from ..shared.embeddings import SharedRotaryEmbedding
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...integrations.hub_kernels import use_kernel_forward_from_hub
@@ -155,213 +156,38 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 
 
-class GptOssRotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
-    def __init__(self, config: GptOssConfig, device=None):
-        super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
-        else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
-
-    @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = freqs
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(x.dtype), sin.to(x.dtype)
+# Use SharedRotaryEmbedding with GPT-OSS configuration (auto-detects model_type)
+GptOssRotaryEmbedding = SharedRotaryEmbedding
 
 
 
 
-# GPT OSS has a special rotary embedding that doesn't concatenate freqs
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    first_half, second_half = torch.chunk(x, 2, dim=-1)
-    first_ = first_half * cos - second_half * sin
-    second_ = second_half * cos + first_half * sin
-    return torch.cat((first_, second_), dim=-1)
+# apply_rotary_pos_emb is handled by SharedAttention with GPT-OSS style detection
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """GPT OSS specific rotary position embedding that uses _apply_rotary_emb instead of rotate_half."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = _apply_rotary_emb(q, cos, sin)
-    k_embed = _apply_rotary_emb(k, cos, sin)
-    return q_embed, k_embed
+# eager_attention_forward is handled by SharedAttention with sinks support
 
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
-    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
-
-    # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
-    # when training with bsz>1 we clamp max values.
-
-    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-    scores = probs[..., :-1]  # we drop the sink here
-    attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
-
-
-class GptOssAttention(nn.Module):
+# Use SharedAttention with GPT-OSS configuration (includes sinks support)
+class GptOssAttention(SharedAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: GptOssConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_values is not None:
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,  # diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        # Set use_sinks flag before calling parent init
+        config.use_sinks = True
+        super().__init__(config, layer_idx)
 
 
-class GptOssDecoderLayer(GradientCheckpointingLayer):
+
+# Use SharedDecoderLayer with GPT-OSS configuration
+class GptOssDecoderLayer(SharedDecoderLayer):
     def __init__(self, config: GptOssConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
+        # Set use_sinks flag before calling parent init
+        config.use_sinks = True
+        super().__init__(config, layer_idx)
+        # Replace the self_attn with GptOssAttention and mlp with GptOssMLP
         self.self_attn = GptOssAttention(config=config, layer_idx=layer_idx)
         self.mlp = GptOssMLP(config)
-        self.input_layernorm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention_type = config.layer_types[layer_idx]
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
-        hidden_states = residual + hidden_states
-        return hidden_states
 
 
 @auto_docstring

@@ -32,7 +32,16 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    # Handle sinks for GPT-OSS
+    if hasattr(module, 'use_sinks') and module.use_sinks:
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query_states.shape[0], -1, query_states.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        probs = nn.functional.softmax(combined_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = probs[..., :-1]  # drop the sink column
+    else:
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
 
@@ -114,6 +123,11 @@ class SharedAttention(nn.Module):
         else:
             self.sliding_window = getattr(config, 'sliding_window', None)
 
+        # Handle sinks for GPT-OSS
+        self.use_sinks = getattr(config, 'use_sinks', False)
+        if self.use_sinks:
+            self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
+
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -147,7 +161,9 @@ class SharedAttention(nn.Module):
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Use GPT-OSS style if needed
+        use_gpt_oss_style = hasattr(self.config, 'model_type') and self.config.model_type == 'gpt_oss'
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, use_gpt_oss_style=use_gpt_oss_style)
 
         # Handle clip_qkv for OLMo models
         clip_qkv = getattr(self.config, 'clip_qkv', None)

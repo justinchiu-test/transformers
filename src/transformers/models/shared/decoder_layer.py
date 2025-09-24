@@ -96,7 +96,12 @@ class SharedDecoderLayer(GradientCheckpointingLayer):
 
             # Fully Connected
             residual = hidden_states
-            hidden_states = self.mlp(hidden_states)
+            mlp_output = self.mlp(hidden_states)
+            # Handle MoE models that return (output, router_scores)
+            if isinstance(mlp_output, tuple):
+                hidden_states, _ = mlp_output
+            else:
+                hidden_states = mlp_output
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
         else:
@@ -120,7 +125,12 @@ class SharedDecoderLayer(GradientCheckpointingLayer):
             # Fully Connected
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
+            mlp_output = self.mlp(hidden_states)
+            # Handle MoE models that return (output, router_scores)
+            if isinstance(mlp_output, tuple):
+                hidden_states, _ = mlp_output
+            else:
+                hidden_states = mlp_output
             hidden_states = residual + hidden_states
 
         return hidden_states

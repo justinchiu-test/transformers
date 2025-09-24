@@ -10,7 +10,15 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def _apply_rotary_emb_gpt_oss(x, cos, sin):
+    """GPT-OSS specific rotary embedding application."""
+    first_half, second_half = torch.chunk(x, 2, dim=-1)
+    first_ = first_half * cos - second_half * sin
+    second_ = second_half * cos + first_half * sin
+    return torch.cat((first_, second_), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1, use_gpt_oss_style=False):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -27,13 +35,21 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
             k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+        use_gpt_oss_style (`bool`, *optional*, defaults to False):
+            Whether to use GPT-OSS style rotary embedding application.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    if use_gpt_oss_style:
+        q_embed = _apply_rotary_emb_gpt_oss(q, cos, sin)
+        k_embed = _apply_rotary_emb_gpt_oss(k, cos, sin)
+    else:
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
 
@@ -58,6 +74,12 @@ class SharedRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
+        # Handle GPT-OSS style (no frequency concatenation)
+        self.use_freq_concat = getattr(config, 'use_freq_concat', True)
+        # Detect GPT-OSS model by model_type
+        if hasattr(config, 'model_type') and config.model_type == 'gpt_oss':
+            self.use_freq_concat = False
+
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
@@ -67,7 +89,11 @@ class SharedRotaryEmbedding(nn.Module):
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
+            if self.use_freq_concat:
+                emb = torch.cat((freqs, freqs), dim=-1)
+            else:
+                # GPT-OSS style: no concatenation
+                emb = freqs
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
