@@ -159,15 +159,6 @@ class GptOssMLP(nn.Module):
 # Use SharedRotaryEmbedding with GPT-OSS configuration (auto-detects model_type)
 GptOssRotaryEmbedding = SharedRotaryEmbedding
 
-
-
-
-# apply_rotary_pos_emb is handled by SharedAttention with GPT-OSS style detection
-
-
-# eager_attention_forward is handled by SharedAttention with sinks support
-
-
 # Use SharedAttention with GPT-OSS configuration (includes sinks support)
 class GptOssAttention(SharedAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -176,7 +167,6 @@ class GptOssAttention(SharedAttention):
         # Set use_sinks flag before calling parent init
         config.use_sinks = True
         super().__init__(config, layer_idx)
-
 
 
 # Use SharedDecoderLayer with GPT-OSS configuration
