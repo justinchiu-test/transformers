@@ -46,8 +46,8 @@ from ...utils.generic import check_model_inputs
 from .configuration_qwen3 import Qwen3Config
 from ..shared.normalization import SharedRMSNorm
 from ..shared.mlp import SharedMLP
-from ..shared.embeddings import apply_rotary_pos_emb, rotate_half
-from ..shared.attention import SharedAttention
+from ..shared.embeddings import apply_rotary_pos_emb, rotate_half, SharedRotaryEmbedding
+from ..shared.attention import SharedAttention, repeat_kv
 
 
 # Use SharedRMSNorm instead of Qwen3RMSNorm
@@ -61,17 +61,7 @@ Qwen3MLP = SharedMLP
 # rotate_half and apply_rotary_pos_emb are imported from shared.embeddings
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
+# repeat_kv is imported from shared.attention
 
 # eager_attention_forward is imported via SharedAttention
 # Use SharedAttention instead of Qwen3Attention
@@ -144,40 +134,8 @@ class Qwen3PreTrainedModel(PreTrainedModel):
     }
 
 
-class Qwen3RotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
-    def __init__(self, config: Qwen3Config, device=None):
-        super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
-        else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
-
-    @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+# Use SharedRotaryEmbedding instead of Qwen3RotaryEmbedding
+Qwen3RotaryEmbedding = SharedRotaryEmbedding
 
 
 @auto_docstring
