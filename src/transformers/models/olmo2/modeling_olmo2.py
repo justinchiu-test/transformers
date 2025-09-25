@@ -13,6 +13,7 @@ from transformers.utils.generic import TransformersKwargs
 
 from ..shared import SharedAttention, SharedMLP, SharedRMSNorm, SharedDecoderLayer, repeat_kv
 from ..shared.embeddings import apply_rotary_pos_emb, rotate_half, SharedRotaryEmbedding
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -52,18 +53,9 @@ Olmo2RotaryEmbedding = SharedRotaryEmbedding
 
 
 @auto_docstring
-class Olmo2PreTrainedModel(PreTrainedModel):
+class Olmo2PreTrainedModel(SharedPreTrainedModel):
     config: Olmo2Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["Olmo2DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": Olmo2DecoderLayer,
         "attentions": SharedAttention,
@@ -71,19 +63,15 @@ class Olmo2PreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class Olmo2Model(Olmo2PreTrainedModel):
+class Olmo2Model(SharedModel, Olmo2PreTrainedModel):
     def __init__(self, config: Olmo2Config):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        SharedModel.__init__(self, config, decoder_layer_class=Olmo2DecoderLayer)
         self.layers = nn.ModuleList(
             [Olmo2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Olmo2RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
+        # gradient_checkpointing is set by SharedModel
 
         # Initialize weights and apply final processing
         self.post_init()

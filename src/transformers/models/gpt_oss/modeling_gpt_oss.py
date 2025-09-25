@@ -27,6 +27,7 @@ from torch.nn import functional as F
 from ..shared import SharedRMSNorm, SharedAttention, SharedDecoderLayer, repeat_kv
 from ..shared.embeddings import SharedRotaryEmbedding
 from ..shared.moe import SharedMoE, SharedRouter, SharedExperts
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...integrations.hub_kernels import use_kernel_forward_from_hub
@@ -96,18 +97,10 @@ class GptOssDecoderLayer(SharedDecoderLayer):
 
 
 @auto_docstring
-class GptOssPreTrainedModel(PreTrainedModel):
+class GptOssPreTrainedModel(SharedPreTrainedModel):
     config: GptOssConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["GptOssDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
     _supports_sdpa = False
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
     _can_record_outputs = {
         "router_logits": OutputRecorder(GptOssTopKRouter, index=0),
         "hidden_states": GptOssDecoderLayer,
@@ -147,24 +140,11 @@ class GptOssPreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class GptOssModel(GptOssPreTrainedModel):
+class GptOssModel(SharedModel, GptOssPreTrainedModel):
     _no_split_modules = ["GptOssDecoderLayer"]
 
     def __init__(self, config: GptOssConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = GptOssRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
-        self.post_init()
+        SharedModel.__init__(self, config, decoder_layer_class=GptOssDecoderLayer)
 
     @check_model_inputs
     @auto_docstring

@@ -85,6 +85,9 @@ class SharedModel(SharedPreTrainedModel):
 
         # Rotary embeddings
         self.rotary_emb = SharedRotaryEmbedding(config=config)
+
+        # The gradient_checkpointing attribute must exist for compatibility
+        # It will be set properly by post_init() if config.gradient_checkpointing is True
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
