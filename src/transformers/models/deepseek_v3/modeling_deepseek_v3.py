@@ -5,7 +5,7 @@
 #                          modular_deepseek_v3.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 import math
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -91,18 +91,6 @@ class DeepseekV3MoE(SharedMoE):
         """Override to return just the output, not the tuple."""
         output, _ = super().forward(hidden_states)
         return output
-
-
-# rotate_half is imported from shared.embeddings
-
-
-# apply_rotary_pos_emb is imported from shared.embeddings
-
-
-# repeat_kv is imported from shared
-
-
-# eager_attention_forward is imported from shared.attention
 
 
 def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -275,13 +263,15 @@ class DeepseekV3Attention(nn.Module):
 class DeepseekV3DecoderLayer(SharedDecoderLayer):
     def __init__(self, config: DeepseekV3Config, layer_idx: int):
         super().__init__(config, layer_idx)
+        # Replace the SharedAttention with DeepseekV3Attention (needed for MLA)
+        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)
         # Replace MLP with MoE for layers >= first_k_dense_replace
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = DeepseekV3MoE(config)
         else:
             self.mlp = DeepseekV3MLP(config)
 
-    # Override forward to match DeepSeek V3's original signature (returns just hidden_states)
+    # Override forward to handle attention outputs properly
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -292,10 +282,14 @@ class DeepseekV3DecoderLayer(SharedDecoderLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        # Call parent's forward method
-        hidden_states = super().forward(
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -305,6 +299,17 @@ class DeepseekV3DecoderLayer(SharedDecoderLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        hidden_states, attn_weights = attn_outputs
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        if output_attentions:
+            return hidden_states, attn_weights
         return hidden_states
 
 
@@ -362,8 +367,15 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -394,21 +406,47 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        # Initialize lists to store outputs
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                output_attentions=output_attentions,
                 **kwargs,
             )
 
+            # Check if layer returns tuple (for attention weights)
+            if isinstance(layer_outputs, tuple):
+                hidden_states = layer_outputs[0]
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+            else:
+                hidden_states = layer_outputs
+                if output_attentions:
+                    # Layer doesn't return attentions, add None
+                    all_self_attns += (None,)
+
         hidden_states = self.norm(hidden_states)
+
+        # Add last hidden state
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
         )
 
 
