@@ -36,7 +36,7 @@ from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ..shared.base_models import SharedPreTrainedModel
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...processing_utils import Unpack
 from ...utils import (
     TransformersKwargs,
@@ -52,6 +52,7 @@ from ..qwen2.modeling_qwen2 import (
 from ..shared.mlp import SharedMLP
 from ..shared.attention import repeat_kv, eager_attention_forward
 from ..shared.embeddings import rotate_half
+from ..shared.decoder_layer import SharedDecoderLayer
 from .configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
 
@@ -508,21 +509,16 @@ class Qwen2VLAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
+class Qwen2VLDecoderLayer(SharedDecoderLayer):
     def __init__(self, config: Qwen2VLTextConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
+        super().__init__(config, layer_idx)
+        # Override attention with Qwen2VL-specific attention for vision support
         if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
         self.self_attn = Qwen2VLAttention(config, layer_idx)
-
-        self.mlp = SharedMLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -696,26 +692,15 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
 
 
 @auto_docstring
-class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
+class Qwen2VLTextModel(SharedModel, Qwen2VLPreTrainedModel):
     config: Qwen2VLTextConfig
 
     def __init__(self, config: Qwen2VLTextConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen2VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+        SharedModel.__init__(self, config, decoder_layer_class=Qwen2VLDecoderLayer)
         self._attn_implementation = config._attn_implementation
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Override rotary_emb with Qwen2VL specific version
         self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-
-        self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
 
     @auto_docstring
     def forward(
