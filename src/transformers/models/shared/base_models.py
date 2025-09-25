@@ -5,7 +5,7 @@ from torch import nn
 
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
-from ...masking_utils import create_causal_mask
+from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
@@ -128,7 +128,12 @@ class SharedModel(SharedPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        # Support sliding window for models like Mistral
+        mask_function = create_causal_mask
+        if hasattr(self.config, 'sliding_window') and self.config.sliding_window is not None:
+            mask_function = create_sliding_window_causal_mask
+
+        causal_mask = mask_function(
             config=self.config,
             input_embeds=inputs_embeds,
             attention_mask=attention_mask,
