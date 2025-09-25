@@ -70,27 +70,21 @@ class MixtralSparseMoeBlock(SharedMoE):
     """
 
     def __init__(self, config):
+        # Create a copy to avoid modifying the original config
+        import copy
+        moe_config = copy.copy(config)
         # Ensure Mixtral specific settings
-        config.top_k = config.num_experts_per_tok
-        config.num_experts = config.num_local_experts
-        config.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.0)
-        config.router_bias = False  # Mixtral doesn't use router bias
-        config.norm_topk_prob = True  # Mixtral normalizes routing weights
-        config.moe_intermediate_size = config.intermediate_size
-        super().__init__(config)
+        moe_config.top_k = config.num_experts_per_tok
+        moe_config.num_experts = config.num_local_experts
+        moe_config.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.0)
+        moe_config.router_bias = False  # Mixtral doesn't use router bias
+        moe_config.norm_topk_prob = True  # Mixtral normalizes routing weights
+        moe_config.moe_intermediate_size = config.intermediate_size
+        super().__init__(moe_config)
 
 
 # Use SharedRMSNorm instead of MixtralRMSNorm
 MixtralRMSNorm = SharedRMSNorm
-
-
-# rotate_half and apply_rotary_pos_emb are imported from shared.embeddings
-
-
-# repeat_kv is imported from shared.attention
-
-
-# eager_attention_forward is imported via SharedAttention
 
 
 # Use SharedAttention instead of MixtralAttention

@@ -14,14 +14,9 @@ class SharedRouter(nn.Module):
         self.num_experts = getattr(config, 'num_local_experts', getattr(config, 'num_experts', 8))
         self.hidden_dim = config.hidden_size
 
-        # Router weights (all models have this)
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
-
-        # Router bias (GPT-OSS has it, others can configure)
-        if getattr(config, 'router_bias', True) if hasattr(config, 'model_type') and config.model_type == 'gpt_oss' else False:
-            self.bias = nn.Parameter(torch.empty(self.num_experts))
-        else:
-            self.register_parameter('bias', None)
+        # Router gate (using Linear for automatic initialization)
+        use_bias = getattr(config, 'router_bias', True) if hasattr(config, 'model_type') and config.model_type == 'gpt_oss' else False
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=use_bias)
 
         # Mixtral-specific: jitter noise
         self.jitter_noise = getattr(config, 'router_jitter_noise', 0.0)
@@ -60,8 +55,8 @@ class SharedRouter(nn.Module):
                 1.0 - self.jitter_noise, 1.0 + self.jitter_noise
             )
 
-        # Compute router logits (GPT-OSS style with F.linear)
-        router_logits = F.linear(hidden_states, self.weight, self.bias)
+        # Compute router logits
+        router_logits = self.gate(hidden_states)
 
         # DeepSeek V3: Group-limited selection
         if self.n_group and self.topk_group:
@@ -84,8 +79,7 @@ class SharedRouter(nn.Module):
             router_top_values = F.softmax(router_top_values, dim=1, dtype=router_top_values.dtype)
 
         # DeepSeek V3 & Mixtral: Optional normalization
-        if self.norm_topk_prob or (hasattr(original_shape, '__len__') and len(original_shape) == 3 and
-                                   hasattr(self, 'model_type') and self.model_type == 'mixtral'):
+        if self.norm_topk_prob:
             denominator = router_top_values.sum(dim=-1, keepdim=True) + 1e-20
             router_top_values = router_top_values / denominator
 

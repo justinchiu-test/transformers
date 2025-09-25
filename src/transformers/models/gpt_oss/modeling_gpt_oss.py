@@ -132,15 +132,18 @@ class GptOssPreTrainedModel(PreTrainedModel):
         elif isinstance(module, SharedRMSNorm):
             module.weight.data.fill_(1.0)
         elif isinstance(module, GptOssExperts):
-            module.gate_up_proj.data.normal_(mean=0.0, std=std)
-            module.gate_up_proj_bias.data.zero_()
-            module.down_proj.data.normal_(mean=0.0, std=std)
-            module.down_proj_bias.data.zero_()
+            # SharedExperts with fused experts
+            if hasattr(module, 'gate_up_proj'):
+                module.gate_up_proj.data.normal_(mean=0.0, std=std)
+                module.gate_up_proj_bias.data.zero_()
+                module.down_proj.data.normal_(mean=0.0, std=std)
+                module.down_proj_bias.data.zero_()
+            # Otherwise experts are nn.ModuleList of MLPs that auto-initialize
         elif isinstance(module, GptOssAttention):
             module.sinks.data.normal_(mean=0.0, std=std)
         elif isinstance(module, GptOssTopKRouter):
-            module.weight.data.normal_(mean=0.0, std=std)
-            module.bias.data.normal_(mean=0.0, std=std)
+            # SharedRouter uses nn.Linear which auto-initializes
+            pass
 
 
 @auto_docstring
