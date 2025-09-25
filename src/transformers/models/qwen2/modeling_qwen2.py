@@ -26,6 +26,7 @@ from ...modeling_layers import (
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
@@ -51,18 +52,9 @@ Qwen2DecoderLayer = SharedDecoderLayer
 
 
 @auto_docstring
-class Qwen2PreTrainedModel(PreTrainedModel):
+class Qwen2PreTrainedModel(SharedPreTrainedModel):
     config: Qwen2Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen2DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": Qwen2DecoderLayer,
         "attentions": SharedAttention,
@@ -74,23 +66,10 @@ Qwen2RotaryEmbedding = SharedRotaryEmbedding
 
 
 @auto_docstring
-class Qwen2Model(Qwen2PreTrainedModel):
+class Qwen2Model(SharedModel, Qwen2PreTrainedModel):
     def __init__(self, config: Qwen2Config):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
+        SharedModel.__init__(self, config, decoder_layer_class=Qwen2DecoderLayer)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-
-        # Initialize weights and apply final processing
-        self.post_init()
 
     @check_model_inputs
     @auto_docstring

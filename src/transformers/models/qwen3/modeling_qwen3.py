@@ -49,6 +49,8 @@ from ..shared.mlp import SharedMLP
 from ..shared.embeddings import apply_rotary_pos_emb, rotate_half, SharedRotaryEmbedding
 from ..shared.attention import SharedAttention, repeat_kv
 from ..shared.decoder_layer import SharedDecoderLayer
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
+from ..shared.decoder_layer import SharedDecoderLayer
 
 
 # Use SharedRMSNorm instead of Qwen3RMSNorm
@@ -74,18 +76,9 @@ Qwen3DecoderLayer = SharedDecoderLayer
 
 
 @auto_docstring
-class Qwen3PreTrainedModel(PreTrainedModel):
+class Qwen3PreTrainedModel(SharedPreTrainedModel):
     config: Qwen3Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen3DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": Qwen3DecoderLayer,
         "attentions": Qwen3Attention,
@@ -97,23 +90,10 @@ Qwen3RotaryEmbedding = SharedRotaryEmbedding
 
 
 @auto_docstring
-class Qwen3Model(Qwen3PreTrainedModel):
+class Qwen3Model(SharedModel, Qwen3PreTrainedModel):
     def __init__(self, config: Qwen3Config):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
+        SharedModel.__init__(self, config, decoder_layer_class=Qwen3DecoderLayer)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-
-        # Initialize weights and apply final processing
-        self.post_init()
 
     @check_model_inputs
     @auto_docstring

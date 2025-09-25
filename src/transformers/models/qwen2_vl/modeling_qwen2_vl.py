@@ -36,6 +36,7 @@ from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ..shared.base_models import SharedPreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import (
     TransformersKwargs,
@@ -592,17 +593,9 @@ class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class Qwen2VLPreTrainedModel(PreTrainedModel):
+class Qwen2VLPreTrainedModel(SharedPreTrainedModel):
     config: Qwen2VLConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen2VLDecoderLayer", "Qwen2VLVisionBlock"]
-    _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn = True
-    _supports_sdpa = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
 
 
 @auto_docstring
