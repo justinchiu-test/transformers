@@ -47,6 +47,7 @@ from ...modeling_layers import (
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
@@ -105,17 +106,10 @@ MixtralRotaryEmbedding = SharedRotaryEmbedding
 
 
 @auto_docstring
-class MixtralPreTrainedModel(PreTrainedModel):
+class MixtralPreTrainedModel(SharedPreTrainedModel):
     config: MixtralConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["MixtralDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
     _can_compile_fullgraph = False  # MoE models don't work with torch.compile (`torch.where(condition)` not supported)
-    _supports_attention_backend = True
     _can_record_outputs = {
         "router_logits": OutputRecorder(MixtralSparseMoeBlock, index=1),
         "hidden_states": MixtralDecoderLayer,
@@ -124,22 +118,9 @@ class MixtralPreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class MixtralModel(MixtralPreTrainedModel):
+class MixtralModel(SharedModel, MixtralPreTrainedModel):
     def __init__(self, config: MixtralConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [MixtralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = MixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = MixtralRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
-        self.post_init()
+        SharedModel.__init__(self, config, decoder_layer_class=MixtralDecoderLayer)
 
     @check_model_inputs
     @auto_docstring

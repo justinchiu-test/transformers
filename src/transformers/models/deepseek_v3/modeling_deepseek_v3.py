@@ -30,6 +30,7 @@ from ...modeling_layers import (
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
@@ -301,17 +302,10 @@ class DeepseekV3DecoderLayer(SharedDecoderLayer):
 
 
 @auto_docstring
-class DeepseekV3PreTrainedModel(PreTrainedModel):
+class DeepseekV3PreTrainedModel(SharedPreTrainedModel):
     config: DeepseekV3Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["DeepseekV3DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
     _can_compile_fullgraph = False
-    _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": DeepseekV3DecoderLayer,
         "attentions": DeepseekV3Attention,
@@ -324,24 +318,11 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class DeepseekV3Model(DeepseekV3PreTrainedModel):
+class DeepseekV3Model(SharedModel, DeepseekV3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"model\.layers\.61.*"]
 
     def __init__(self, config: DeepseekV3Config):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
-        self.post_init()
+        SharedModel.__init__(self, config, decoder_layer_class=DeepseekV3DecoderLayer)
 
     @check_model_inputs
     @auto_docstring
