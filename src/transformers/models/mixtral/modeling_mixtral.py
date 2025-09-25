@@ -55,6 +55,7 @@ from .configuration_mixtral import MixtralConfig
 from ..shared.mlp import SharedMLP
 from ..shared.normalization import SharedRMSNorm
 from ..shared.embeddings import apply_rotary_pos_emb, rotate_half, SharedRotaryEmbedding
+from ..shared.decoder_layer import SharedDecoderLayer
 from ..shared.attention import SharedAttention, repeat_kv
 from ..shared.moe import SharedMoE
 
@@ -91,51 +92,12 @@ MixtralRMSNorm = SharedRMSNorm
 MixtralAttention = SharedAttention
 
 
-class MixtralDecoderLayer(GradientCheckpointingLayer):
+# MixtralDecoderLayer now uses SharedDecoderLayer with MixtralSparseMoeBlock as the MLP
+class MixtralDecoderLayer(SharedDecoderLayer):
     def __init__(self, config: MixtralConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.self_attn = MixtralAttention(config, layer_idx)
-
-        self.block_sparse_moe = MixtralSparseMoeBlock(config)
-        self.input_layernorm = MixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = MixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.FloatTensor:
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, _ = self.block_sparse_moe(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        super().__init__(config, layer_idx)
+        # Replace the standard MLP with MixtralSparseMoeBlock for MoE functionality
+        self.mlp = MixtralSparseMoeBlock(config)
 
 
 # Use SharedRotaryEmbedding instead of MixtralRotaryEmbedding
