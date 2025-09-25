@@ -27,6 +27,7 @@ from torch import nn
 from ...activations import ACT2FN
 from ..shared import SharedAttention, SharedMLP, SharedRMSNorm, SharedDecoderLayer, repeat_kv
 from ..shared.embeddings import apply_rotary_pos_emb, rotate_half, SharedRotaryEmbedding
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask
@@ -62,18 +63,9 @@ GemmaDecoderLayer = SharedDecoderLayer
 
 
 @auto_docstring
-class GemmaPreTrainedModel(PreTrainedModel):
+class GemmaPreTrainedModel(SharedPreTrainedModel):
     config: GemmaConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["GemmaDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": GemmaDecoderLayer,
         "attentions": SharedAttention,
@@ -88,22 +80,9 @@ class GemmaPreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class GemmaModel(GemmaPreTrainedModel):
+class GemmaModel(SharedModel, GemmaPreTrainedModel):
     def __init__(self, config: GemmaConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = SharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=True)
-        self.rotary_emb = GemmaRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
-        self.post_init()
+        SharedModel.__init__(self, config, decoder_layer_class=GemmaDecoderLayer)
 
     @check_model_inputs
     @auto_docstring
