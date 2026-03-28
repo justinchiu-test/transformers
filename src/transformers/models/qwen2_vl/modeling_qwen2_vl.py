@@ -36,6 +36,7 @@ from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ..shared.base_models import SharedPreTrainedModel, SharedModel
 from ...processing_utils import Unpack
 from ...utils import (
     TransformersKwargs,
@@ -48,6 +49,10 @@ from ...utils.deprecation import deprecate_kwarg
 from ..qwen2.modeling_qwen2 import (
     Qwen2RMSNorm,
 )
+from ..shared.mlp import SharedMLP
+from ..shared.attention import repeat_kv, eager_attention_forward
+from ..shared.embeddings import rotate_half
+from ..shared.decoder_layer import SharedDecoderLayer
 from .configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
 
@@ -145,12 +150,7 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+# rotate_half is imported from shared.embeddings
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
@@ -280,42 +280,10 @@ class VisionMlp(nn.Module):
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+# repeat_kv is imported from shared.attention
 
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
+# eager_attention_forward is imported from shared.attention
 
 
 class VisionAttention(nn.Module):
@@ -541,21 +509,16 @@ class Qwen2VLAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
+class Qwen2VLDecoderLayer(SharedDecoderLayer):
     def __init__(self, config: Qwen2VLTextConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
+        super().__init__(config, layer_idx)
+        # Override attention with Qwen2VL-specific attention for vision support
         if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
         self.self_attn = Qwen2VLAttention(config, layer_idx)
-
-        self.mlp = Qwen2MLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -626,17 +589,9 @@ class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class Qwen2VLPreTrainedModel(PreTrainedModel):
+class Qwen2VLPreTrainedModel(SharedPreTrainedModel):
     config: Qwen2VLConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen2VLDecoderLayer", "Qwen2VLVisionBlock"]
-    _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn = True
-    _supports_sdpa = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
 
 
 @auto_docstring
@@ -737,26 +692,15 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
 
 
 @auto_docstring
-class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
+class Qwen2VLTextModel(SharedModel, Qwen2VLPreTrainedModel):
     config: Qwen2VLTextConfig
 
     def __init__(self, config: Qwen2VLTextConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen2VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+        SharedModel.__init__(self, config, decoder_layer_class=Qwen2VLDecoderLayer)
         self._attn_implementation = config._attn_implementation
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Override rotary_emb with Qwen2VL specific version
         self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-
-        self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
 
     @auto_docstring
     def forward(
